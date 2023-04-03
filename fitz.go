@@ -11,7 +11,10 @@ const char *fz_version = FZ_VERSION;
 import "C"
 
 import (
+	"bytes"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"image"
 	"io"
 	"io/ioutil"
@@ -524,4 +527,131 @@ func (f *Document) Close() error {
 	f.data = nil
 
 	return nil
+}
+
+//typedef struct
+//{
+//  float x0, y0;
+//  float x1, y1;
+//} fz_rect;
+
+type BBox struct {
+	X0 float64
+	Y0 float64
+	X1 float64
+	Y1 float64
+}
+
+type TextBlock struct {
+	BBox
+
+	Text   string
+	Width  float64
+	Height float64
+}
+
+type ImageBlock struct {
+	BBox
+	Hash   string
+	Width  float64
+	Height float64
+}
+
+type PageContent struct {
+	Text   []TextBlock
+	Image  []ImageBlock
+	Width  float64
+	Height float64
+}
+
+// ExtractPageContent extract all the text and image blocks frob page
+func (f *Document) ExtractPageContent(pageNumber int) (*PageContent, error) {
+	f.mtx.Lock()
+	defer f.mtx.Unlock()
+
+	if pageNumber >= f.NumPage() {
+		return nil, ErrPageMissing
+	}
+
+	page := C.fz_load_page(f.ctx, f.doc, C.int(pageNumber))
+	defer C.fz_drop_page(f.ctx, page)
+
+	var bounds C.fz_rect
+	bounds = C.fz_bound_page(f.ctx, page)
+
+	var ctm C.fz_matrix
+	ctm = C.fz_scale(C.float(72.0/72), C.float(72.0/72))
+
+	text := C.fz_new_stext_page(f.ctx, bounds)
+	defer C.fz_drop_stext_page(f.ctx, text)
+
+	var opts C.fz_stext_options
+	opts.flags = C.FZ_STEXT_PRESERVE_IMAGES
+
+	device := C.fz_new_stext_device(f.ctx, text, &opts)
+	C.fz_enable_device_hints(f.ctx, device, C.FZ_NO_CACHE)
+	defer C.fz_drop_device(f.ctx, device)
+
+	var cookie C.fz_cookie
+	C.fz_run_page(f.ctx, page, device, ctm, &cookie)
+	C.fz_close_device(f.ctx, device)
+
+	content := PageContent{
+		Width:  float64(bounds.x1),
+		Height: float64(bounds.y1),
+	}
+	for block := text.first_block; block != nil; block = block.next {
+		//fmt.Println(block.bbox, block._type, block.u)
+		bbox := BBox{
+			X0: float64(block.bbox.x0),
+			Y0: float64(block.bbox.y0),
+			X1: float64(block.bbox.x1),
+			Y1: float64(block.bbox.y1),
+		}
+		if block._type == 0 {
+			var union [32]byte = block.u // The union, as eight contiguous bytes of memory
+
+			var addr *byte = &union[0]
+
+			var cast **C.fz_stext_line = (**C.fz_stext_line)(unsafe.Pointer(addr))
+
+			var fz_stext_line *C.fz_stext_line = *cast
+			blockStr := bytes.NewBuffer(nil)
+			for line := fz_stext_line; line != nil; line = line.next {
+				for char := line.first_char; char != nil; char = char.next {
+					blockStr.WriteRune(rune(char.c))
+				}
+				_, _ = fmt.Fprintln(blockStr)
+			}
+			content.Text = append(content.Text, TextBlock{
+				BBox: bbox,
+				Text: blockStr.String(),
+			})
+		}
+		if block._type == 1 { // image
+
+			var union [32]byte = block.u // The union, as eight contiguous bytes of memory
+			var addr *byte = &union[0]
+			var cast **C.fz_image = (**C.fz_image)(unsafe.Add(unsafe.Pointer(addr), 32-8))
+			var fz_image *C.fz_image = *cast
+
+			digest := [16]byte{}
+			digestPtr := (*C.uchar)(unsafe.Pointer(&digest[0]))
+
+			pixmap := C.fz_get_unscaled_pixmap_from_image(f.ctx, fz_image)
+			if pixmap == nil {
+				return nil, ErrPixmapSamples
+			}
+
+			C.fz_md5_pixmap(f.ctx, pixmap, digestPtr)
+			imageHash := hex.EncodeToString(digest[:])
+
+			content.Image = append(content.Image, ImageBlock{
+				BBox: bbox,
+				Hash: imageHash,
+			})
+		}
+	}
+
+	return &content, nil
 }
